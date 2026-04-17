@@ -5,8 +5,10 @@ import { AppService } from './app.service';
 import { validateEnv } from './config/env.schema';
 import { DatabaseModule } from './database/database.module';
 import { AuthModule } from './modules/auth/auth.module';
+import { ChatModule } from './modules/chat/chat.module';
 import { DiscoveryModule } from './modules/discovery/discovery.module';
 import { MatchesModule } from './modules/matches/matches.module';
+import { NotificationsModule } from './modules/notifications/notifications.module';
 import { SettingsModule } from './modules/settings/settings.module';
 import { UsersModule } from './modules/users/users.module';
 import { VerificationModule } from './modules/verification/verification.module';
@@ -19,8 +21,10 @@ import { VerificationModule } from './modules/verification/verification.module';
     }),
     DatabaseModule,
     AuthModule,
+    ChatModule,
     DiscoveryModule,
     MatchesModule,
+    NotificationsModule,
     SettingsModule,
     UsersModule,
     VerificationModule,

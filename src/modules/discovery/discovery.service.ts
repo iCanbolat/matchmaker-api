@@ -6,7 +6,14 @@ import {
 } from '@nestjs/common';
 import { and, asc, desc, eq, gte, inArray, isNull, ne, sql } from 'drizzle-orm';
 import { DatabaseService } from '../../database/database.service';
-import { matches, swipes, userPhotos, users } from '../../database/schema';
+import {
+  conversations,
+  matches,
+  swipes,
+  userPhotos,
+  users,
+} from '../../database/schema';
+import { NotificationsService } from '../notifications/notifications.service';
 import { ReferralBonusService } from '../referrals/referral-bonus.service';
 import {
   type SwipeDirection,
@@ -39,6 +46,11 @@ type MatchSummary = {
   matchedAt: Date;
 };
 
+type MatchCreationResult = {
+  match: MatchSummary | null;
+  created: boolean;
+};
+
 type TransactionClient = {
   select: DatabaseService['db']['select'];
   insert: DatabaseService['db']['insert'];
@@ -66,6 +78,7 @@ export class DiscoveryService {
   constructor(
     private readonly databaseService: DatabaseService,
     private readonly referralBonusService: ReferralBonusService,
+    private readonly notificationsService: NotificationsService,
   ) {}
 
   private get db() {
@@ -166,7 +179,7 @@ export class DiscoveryService {
       throw new BadRequestException('You cannot swipe yourself.');
     }
 
-    return this.db.transaction(async (tx) => {
+    const result = await this.db.transaction(async (tx) => {
       const [swiper] = await tx
         .select({
           id: users.id,
@@ -261,7 +274,7 @@ export class DiscoveryService {
         throw new BadRequestException('You have already swiped this user.');
       }
 
-      const match = await this.tryCreateMatch(
+      const matchResult = await this.tryCreateMatch(
         tx,
         swiperId,
         dto.swipedUserId,
@@ -273,7 +286,8 @@ export class DiscoveryService {
 
       return {
         swipe,
-        match,
+        match: matchResult.match,
+        matchCreated: matchResult.created,
         limit: {
           tier: effectiveTier,
           dailySwipeLimit,
@@ -282,6 +296,18 @@ export class DiscoveryService {
         },
       };
     });
+
+    const { matchCreated, ...publicResult } = result;
+
+    if (matchCreated && publicResult.match) {
+      await this.notificationsService.notifyMatchCreated(
+        publicResult.match.id,
+        publicResult.match.user1Id,
+        publicResult.match.user2Id,
+      );
+    }
+
+    return publicResult;
   }
 
   async getSwipeLimitStatus(userId: string) {
@@ -367,9 +393,12 @@ export class DiscoveryService {
     swiperId: string,
     swipedUserId: string,
     direction: SwipeDirection,
-  ): Promise<MatchSummary | null> {
+  ): Promise<MatchCreationResult> {
     if (!this.isMatchTriggerDirection(direction)) {
-      return null;
+      return {
+        match: null,
+        created: false,
+      };
     }
 
     const [reciprocalSwipe] = await tx
@@ -386,7 +415,10 @@ export class DiscoveryService {
       .limit(1);
 
     if (!reciprocalSwipe) {
-      return null;
+      return {
+        match: null,
+        created: false,
+      };
     }
 
     const pair = this.toCanonicalMatchPair(swiperId, swipedUserId);
@@ -407,7 +439,11 @@ export class DiscoveryService {
       });
 
     if (createdMatch) {
-      return createdMatch;
+      await this.ensureConversationForMatch(tx, createdMatch.id);
+      return {
+        match: createdMatch,
+        created: true,
+      };
     }
 
     const [existingActiveMatch] = await tx
@@ -427,7 +463,30 @@ export class DiscoveryService {
       )
       .limit(1);
 
-    return existingActiveMatch ?? null;
+    if (existingActiveMatch) {
+      await this.ensureConversationForMatch(tx, existingActiveMatch.id);
+      return {
+        match: existingActiveMatch,
+        created: false,
+      };
+    }
+
+    return {
+      match: null,
+      created: false,
+    };
+  }
+
+  private async ensureConversationForMatch(
+    tx: TransactionClient,
+    matchId: string,
+  ): Promise<void> {
+    await tx
+      .insert(conversations)
+      .values({
+        matchId,
+      })
+      .onConflictDoNothing();
   }
 
   private toCanonicalMatchPair(

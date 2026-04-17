@@ -33,6 +33,19 @@ export const envSchema = z.object({
   DATABASE_POOL_MIN: z.coerce.number().int().positive().default(5),
   DATABASE_POOL_MAX: z.coerce.number().int().positive().default(20),
 
+  REDIS_HOST: z.string().default('localhost'),
+  REDIS_PORT: z.coerce.number().int().positive().default(6379),
+  REDIS_PASSWORD: z.string().default(''),
+  REDIS_DB: z.coerce.number().int().nonnegative().default(0),
+  NOTIFICATIONS_QUEUE_ENABLED: envBoolean.default(false),
+  PUSH_DELIVERY_ENABLED: envBoolean.default(false),
+  ONESIGNAL_APP_ID: z.string().min(1).optional(),
+  ONESIGNAL_REST_API_KEY: z.string().min(1).optional(),
+  ONESIGNAL_API_BASE_URL: z
+    .string()
+    .url()
+    .default('https://onesignal.com/api/v1'),
+
   JWT_ACCESS_SECRET: z.string().min(16).default('dev-access-secret-change-me'),
   JWT_ACCESS_EXPIRATION: z.string().default('15m'),
   JWT_REFRESH_SECRET: z
