@@ -13,3 +13,5 @@ export * from './notification-device-tokens';
 export * from './subscriptions';
 export * from './profile-views';
 export * from './user-boosts';
+export * from './reports';
+export * from './blocks';

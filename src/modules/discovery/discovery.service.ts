@@ -4,7 +4,19 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { and, asc, desc, eq, gte, inArray, isNull, ne, sql } from 'drizzle-orm';
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gte,
+  inArray,
+  isNull,
+  ne,
+  notInArray,
+  sql,
+} from 'drizzle-orm';
+import { AppCacheService } from '../../common/performance/app-cache.service';
 import { DatabaseService } from '../../database/database.service';
 import {
   conversations,
@@ -14,6 +26,7 @@ import {
   userPhotos,
   users,
 } from '../../database/schema';
+import { BlocksService } from '../blocks/blocks.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ProfileViewsService } from '../profile-views/profile-views.service';
 import { ReferralBonusService } from '../referrals/referral-bonus.service';
@@ -64,6 +77,8 @@ type SelectClient = {
 const DEFAULT_DISCOVERY_CARDS_LIMIT = 20;
 const MAX_DISCOVERY_CARDS_LIMIT = 50;
 const BOOST_DURATION_MINUTES = 30;
+const DISCOVERY_CARDS_CACHE_TTL_SECONDS = 15;
+const SWIPE_LIMIT_CACHE_TTL_SECONDS = 8;
 const MATCH_TRIGGER_DIRECTIONS: Array<(typeof SWIPE_DIRECTIONS)[number]> = [
   'like',
   'super_like',
@@ -72,6 +87,8 @@ const MATCH_TRIGGER_DIRECTIONS: Array<(typeof SWIPE_DIRECTIONS)[number]> = [
 @Injectable()
 export class DiscoveryService {
   constructor(
+    private readonly appCacheService: AppCacheService,
+    private readonly blocksService: BlocksService,
     private readonly databaseService: DatabaseService,
     private readonly referralBonusService: ReferralBonusService,
     private readonly notificationsService: NotificationsService,
@@ -88,104 +105,124 @@ export class DiscoveryService {
     requestedLimit?: number,
   ): Promise<{ count: number; cards: DiscoveryCard[] }> {
     const limit = this.resolveCardsLimit(requestedLimit);
-    const boostRank = sql<number>`
-      case when exists (
-        select 1
-        from user_boosts ub
-        where ub.user_id = ${users.id}
-          and ub.starts_at <= now()
-          and ub.expires_at > now()
-      ) then 1 else 0 end
-    `;
-
     await this.assertUserCanUseDiscovery(userId);
 
-    const candidates = await this.db
-      .select({
-        id: users.id,
-        firstName: users.firstName,
-        lastName: users.lastName,
-        birthDate: users.birthDate,
-        gender: users.gender,
-        bio: users.bio,
-        boostRank,
-      })
-      .from(users)
-      .where(
-        and(
-          ne(users.id, userId),
-          isNull(users.deletedAt),
-          eq(users.isActive, true),
-          eq(users.isFrozen, false),
-          eq(users.isVerified, true),
-          sql`not exists (
+    return this.appCacheService.getOrSet(
+      this.getDiscoveryCardsCacheKey(userId, limit),
+      DISCOVERY_CARDS_CACHE_TTL_SECONDS,
+      async () => {
+        const blockedUserIds =
+          await this.blocksService.getBlockedRelationUserIds(userId);
+        const boostRank = sql<number>`
+          case when exists (
             select 1
-            from swipes s
-            where s.swiper_id = ${userId}
-              and s.swiped_id = ${users.id}
-              and s.is_undone = false
-          )`,
-        ),
-      )
-      .orderBy(desc(boostRank), desc(users.createdAt))
-      .limit(limit);
+            from user_boosts ub
+            where ub.user_id = ${users.id}
+              and ub.starts_at <= now()
+              and ub.expires_at > now()
+          ) then 1 else 0 end
+        `;
 
-    if (candidates.length === 0) {
-      return {
-        count: 0,
-        cards: [],
-      };
-    }
+        const candidates = await this.db
+          .select({
+            id: users.id,
+            firstName: users.firstName,
+            lastName: users.lastName,
+            birthDate: users.birthDate,
+            gender: users.gender,
+            bio: users.bio,
+            boostRank,
+          })
+          .from(users)
+          .where(
+            and(
+              ne(users.id, userId),
+              isNull(users.deletedAt),
+              eq(users.isActive, true),
+              eq(users.isFrozen, false),
+              eq(users.isVerified, true),
+              blockedUserIds.length > 0
+                ? notInArray(users.id, blockedUserIds)
+                : undefined,
+              sql`not exists (
+                select 1
+                from swipes s
+                where s.swiper_id = ${userId}
+                  and s.swiped_id = ${users.id}
+                  and s.is_undone = false
+              )`,
+            ),
+          )
+          .orderBy(desc(boostRank), desc(users.createdAt))
+          .limit(limit);
 
-    const candidateIds = candidates.map((candidate) => candidate.id);
-    const photos = await this.db
-      .select({
-        id: userPhotos.id,
-        userId: userPhotos.userId,
-        url: userPhotos.url,
-        position: userPhotos.position,
-      })
-      .from(userPhotos)
-      .where(inArray(userPhotos.userId, candidateIds))
-      .orderBy(asc(userPhotos.position), asc(userPhotos.createdAt));
+        if (candidates.length === 0) {
+          return {
+            count: 0,
+            cards: [],
+          };
+        }
 
-    const photosByUserId = new Map<
-      string,
-      Array<{ id: string; url: string; position: number }>
-    >();
+        const candidateIds = candidates.map((candidate) => candidate.id);
+        const photos = await this.db
+          .select({
+            id: userPhotos.id,
+            userId: userPhotos.userId,
+            url: userPhotos.url,
+            position: userPhotos.position,
+          })
+          .from(userPhotos)
+          .where(inArray(userPhotos.userId, candidateIds))
+          .orderBy(asc(userPhotos.position), asc(userPhotos.createdAt));
 
-    for (const photo of photos) {
-      const existingPhotos = photosByUserId.get(photo.userId) ?? [];
+        const photosByUserId = new Map<
+          string,
+          Array<{ id: string; url: string; position: number }>
+        >();
 
-      existingPhotos.push({
-        id: photo.id,
-        url: photo.url,
-        position: photo.position,
-      });
+        for (const photo of photos) {
+          const existingPhotos = photosByUserId.get(photo.userId) ?? [];
 
-      photosByUserId.set(photo.userId, existingPhotos);
-    }
+          existingPhotos.push({
+            id: photo.id,
+            url: photo.url,
+            position: photo.position,
+          });
 
-    const cards = candidates.map((candidate) => ({
-      id: candidate.id,
-      firstName: candidate.firstName,
-      lastName: candidate.lastName,
-      age: this.calculateAge(candidate.birthDate),
-      gender: candidate.gender,
-      bio: candidate.bio,
-      isBoosted: Number(candidate.boostRank ?? 0) > 0,
-      photos: photosByUserId.get(candidate.id) ?? [],
-    }));
+          photosByUserId.set(photo.userId, existingPhotos);
+        }
 
-    return {
-      count: cards.length,
-      cards,
-    };
+        const cards = candidates.map((candidate) => ({
+          id: candidate.id,
+          firstName: candidate.firstName,
+          lastName: candidate.lastName,
+          age: this.calculateAge(candidate.birthDate),
+          gender: candidate.gender,
+          bio: candidate.bio,
+          isBoosted: Number(candidate.boostRank ?? 0) > 0,
+          photos: photosByUserId.get(candidate.id) ?? [],
+        }));
+
+        return {
+          count: cards.length,
+          cards,
+        };
+      },
+    );
   }
 
   async swipe(swiperId: string, dto: SwipeDto) {
     if (swiperId === dto.swipedUserId) {
       throw new BadRequestException('You cannot swipe yourself.');
+    }
+
+    const isBlocked = await this.blocksService.isEitherUserBlocked(
+      swiperId,
+      dto.swipedUserId,
+    );
+
+    if (isBlocked) {
+      throw new ForbiddenException('You cannot interact with this user.');
     }
 
     const result = await this.db.transaction(async (tx) => {
@@ -376,11 +413,21 @@ export class DiscoveryService {
       );
     }
 
+    if (publicResult.match) {
+      await this.invalidateMatchesListCache([
+        publicResult.match.user1Id,
+        publicResult.match.user2Id,
+      ]);
+    }
+
+    await this.invalidateUserDiscoveryCaches(swiperId);
+    await this.invalidateProfileViewsCaches(dto.swipedUserId);
+
     return publicResult;
   }
 
   async rewind(userId: string) {
-    return this.db.transaction(async (tx) => {
+    const result = await this.db.transaction(async (tx) => {
       const [user] = await tx
         .select({
           id: users.id,
@@ -479,10 +526,14 @@ export class DiscoveryService {
         },
       };
     });
+
+    await this.invalidateUserDiscoveryCaches(userId);
+
+    return result;
   }
 
   async boost(userId: string) {
-    return this.db.transaction(async (tx) => {
+    const result = await this.db.transaction(async (tx) => {
       const [user] = await tx
         .select({
           id: users.id,
@@ -583,81 +634,105 @@ export class DiscoveryService {
         },
       };
     });
+
+    await this.invalidateUserDiscoveryCaches(userId);
+    await this.appCacheService.delByPrefix(
+      this.getDiscoveryCardsGlobalPrefix(),
+    );
+
+    return result;
   }
 
   async getSwipeLimitStatus(userId: string) {
-    const [user] = await this.db
-      .select({
-        id: users.id,
-        subscriptionTier: users.subscriptionTier,
-        subscriptionExpiresAt: users.subscriptionExpiresAt,
-      })
-      .from(users)
-      .where(
-        and(
-          eq(users.id, userId),
-          isNull(users.deletedAt),
-          eq(users.isActive, true),
-          eq(users.isFrozen, false),
-        ),
-      )
-      .limit(1);
+    return this.appCacheService.getOrSet(
+      this.getSwipeLimitCacheKey(userId),
+      SWIPE_LIMIT_CACHE_TTL_SECONDS,
+      async () => {
+        const [user] = await this.db
+          .select({
+            id: users.id,
+            subscriptionTier: users.subscriptionTier,
+            subscriptionExpiresAt: users.subscriptionExpiresAt,
+          })
+          .from(users)
+          .where(
+            and(
+              eq(users.id, userId),
+              isNull(users.deletedAt),
+              eq(users.isActive, true),
+              eq(users.isFrozen, false),
+            ),
+          )
+          .limit(1);
 
-    if (!user) {
-      throw new NotFoundException('User not found.');
-    }
+        if (!user) {
+          throw new NotFoundException('User not found.');
+        }
 
-    const effectiveTier = this.subscriptionPolicyService.resolveEffectiveTier(
-      user.subscriptionTier,
-      user.subscriptionExpiresAt,
+        const effectiveTier =
+          this.subscriptionPolicyService.resolveEffectiveTier(
+            user.subscriptionTier,
+            user.subscriptionExpiresAt,
+          );
+        const limits =
+          this.subscriptionPolicyService.getLimitsForTier(effectiveTier);
+        const dailyLikeLimit = limits.dailyLikeLimit;
+        const dailySuperLikeLimit = limits.dailySuperLikeLimit;
+
+        const todayLikeCount =
+          dailyLikeLimit === null
+            ? 0
+            : await this.countTodaySwipeByDirection(this.db, userId, 'like');
+        const todaySuperLikeCount =
+          dailySuperLikeLimit === null
+            ? 0
+            : await this.countTodaySwipeByDirection(
+                this.db,
+                userId,
+                'super_like',
+              );
+        const monthBoostCount = await this.countCurrentMonthBoosts(
+          this.db,
+          userId,
+        );
+
+        const remainingSwipeCredits =
+          await this.referralBonusService.getRemainingSwipeCredits(
+            this.db,
+            userId,
+          );
+
+        return {
+          tier: effectiveTier,
+          dailyLikeLimit,
+          dailySuperLikeLimit,
+          dailyRewindLimit: limits.dailyRewindLimit,
+          monthlyBoostLimit: limits.monthlyBoostLimit,
+          dailySwipeLimit: dailyLikeLimit,
+          todayLikeCount,
+          todaySuperLikeCount,
+          monthBoostCount,
+          todaySwipeCount: todayLikeCount,
+          dailyLikeRemaining:
+            dailyLikeLimit === null
+              ? null
+              : Math.max(dailyLikeLimit - todayLikeCount, 0),
+          dailySuperLikeRemaining:
+            dailySuperLikeLimit === null
+              ? null
+              : Math.max(dailySuperLikeLimit - todaySuperLikeCount, 0),
+          dailyRemaining:
+            dailyLikeLimit === null
+              ? null
+              : Math.max(dailyLikeLimit - todayLikeCount, 0),
+          monthlyBoostRemaining:
+            limits.monthlyBoostLimit <= 0
+              ? 0
+              : Math.max(limits.monthlyBoostLimit - monthBoostCount, 0),
+          referralSwipeCreditsRemaining: remainingSwipeCredits,
+        };
+      },
     );
-    const limits =
-      this.subscriptionPolicyService.getLimitsForTier(effectiveTier);
-    const dailyLikeLimit = limits.dailyLikeLimit;
-    const dailySuperLikeLimit = limits.dailySuperLikeLimit;
-
-    const todayLikeCount =
-      dailyLikeLimit === null
-        ? 0
-        : await this.countTodaySwipeByDirection(this.db, userId, 'like');
-    const todaySuperLikeCount =
-      dailySuperLikeLimit === null
-        ? 0
-        : await this.countTodaySwipeByDirection(this.db, userId, 'super_like');
-    const monthBoostCount = await this.countCurrentMonthBoosts(this.db, userId);
-
-    const remainingSwipeCredits =
-      await this.referralBonusService.getRemainingSwipeCredits(this.db, userId);
-
-    return {
-      tier: effectiveTier,
-      dailyLikeLimit,
-      dailySuperLikeLimit,
-      dailyRewindLimit: limits.dailyRewindLimit,
-      monthlyBoostLimit: limits.monthlyBoostLimit,
-      dailySwipeLimit: dailyLikeLimit,
-      todayLikeCount,
-      todaySuperLikeCount,
-      monthBoostCount,
-      todaySwipeCount: todayLikeCount,
-      dailyLikeRemaining:
-        dailyLikeLimit === null
-          ? null
-          : Math.max(dailyLikeLimit - todayLikeCount, 0),
-      dailySuperLikeRemaining:
-        dailySuperLikeLimit === null
-          ? null
-          : Math.max(dailySuperLikeLimit - todaySuperLikeCount, 0),
-      dailyRemaining:
-        dailyLikeLimit === null
-          ? null
-          : Math.max(dailyLikeLimit - todayLikeCount, 0),
-      monthlyBoostRemaining:
-        limits.monthlyBoostLimit <= 0
-          ? 0
-          : Math.max(limits.monthlyBoostLimit - monthBoostCount, 0),
-      referralSwipeCreditsRemaining: remainingSwipeCredits,
-    };
   }
 
   private async tryCreateMatch(
@@ -666,6 +741,18 @@ export class DiscoveryService {
     swipedUserId: string,
     direction: SwipeDirection,
   ): Promise<MatchCreationResult> {
+    const isBlocked = await this.blocksService.isEitherUserBlocked(
+      swiperId,
+      swipedUserId,
+    );
+
+    if (isBlocked) {
+      return {
+        match: null,
+        created: false,
+      };
+    }
+
     if (!this.isMatchTriggerDirection(direction)) {
       return {
         match: null,
@@ -795,6 +882,62 @@ export class DiscoveryService {
     if (!user) {
       throw new NotFoundException('User not found.');
     }
+  }
+
+  private async invalidateUserDiscoveryCaches(userId: string): Promise<void> {
+    await Promise.all([
+      this.appCacheService.delByPrefix(
+        this.getDiscoveryCardsCachePrefix(userId),
+      ),
+      this.appCacheService.del(this.getSwipeLimitCacheKey(userId)),
+    ]);
+  }
+
+  private async invalidateProfileViewsCaches(userId: string): Promise<void> {
+    await Promise.all([
+      this.appCacheService.del(this.getProfileViewsCountCacheKey(userId)),
+      this.appCacheService.delByPrefix(
+        this.getProfileViewsListCachePrefix(userId),
+      ),
+    ]);
+  }
+
+  private async invalidateMatchesListCache(userIds: string[]): Promise<void> {
+    const uniqueUserIds = Array.from(new Set(userIds));
+
+    await Promise.all(
+      uniqueUserIds.map((userId) =>
+        this.appCacheService.del(this.getMatchesListCacheKey(userId)),
+      ),
+    );
+  }
+
+  private getDiscoveryCardsCacheKey(userId: string, limit: number): string {
+    return `discovery:cards:${userId}:${limit}`;
+  }
+
+  private getDiscoveryCardsCachePrefix(userId: string): string {
+    return `discovery:cards:${userId}:`;
+  }
+
+  private getDiscoveryCardsGlobalPrefix(): string {
+    return 'discovery:cards:';
+  }
+
+  private getSwipeLimitCacheKey(userId: string): string {
+    return `discovery:swipe-limit:${userId}`;
+  }
+
+  private getProfileViewsCountCacheKey(userId: string): string {
+    return `profile-views:count:${userId}`;
+  }
+
+  private getProfileViewsListCachePrefix(userId: string): string {
+    return `profile-views:list:${userId}:`;
+  }
+
+  private getMatchesListCacheKey(userId: string): string {
+    return `matches:list:${userId}`;
   }
 
   private resolveCardsLimit(requestedLimit?: number): number {

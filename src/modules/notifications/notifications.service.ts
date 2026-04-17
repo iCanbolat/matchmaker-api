@@ -1,11 +1,17 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { and, desc, eq, inArray, isNull, lt } from 'drizzle-orm';
+import { AppCacheService } from '../../common/performance/app-cache.service';
 import { DatabaseService } from '../../database/database.service';
 import {
   notificationDeviceTokens,
   notifications,
   users,
 } from '../../database/schema';
+import { BlocksService } from '../blocks/blocks.service';
 import { ListNotificationsDto } from './dto/list-notifications.dto';
 import { RegisterDeviceTokenDto } from './dto/register-device-token.dto';
 import { NotificationsGateway } from './notifications.gateway';
@@ -14,6 +20,7 @@ import { type NotificationType } from './notifications.types';
 
 const DEFAULT_NOTIFICATIONS_LIMIT = 20;
 const MAX_NOTIFICATIONS_LIMIT = 100;
+const NOTIFICATIONS_LIST_CACHE_TTL_SECONDS = 10;
 
 type CreateNotificationInput = {
   userId: string;
@@ -26,6 +33,8 @@ type CreateNotificationInput = {
 @Injectable()
 export class NotificationsService {
   constructor(
+    private readonly appCacheService: AppCacheService,
+    private readonly blocksService: BlocksService,
     private readonly databaseService: DatabaseService,
     private readonly notificationsGateway: NotificationsGateway,
     private readonly notificationsQueueService: NotificationsQueueService,
@@ -42,35 +51,45 @@ export class NotificationsService {
     const beforeDate = dto.before ? new Date(dto.before) : null;
     const unreadOnly = dto.unreadOnly === 'true';
 
-    const rows = await this.db
-      .select({
-        id: notifications.id,
-        type: notifications.type,
-        title: notifications.title,
-        body: notifications.body,
-        data: notifications.data,
-        isRead: notifications.isRead,
-        readAt: notifications.readAt,
-        createdAt: notifications.createdAt,
-      })
-      .from(notifications)
-      .where(
-        and(
-          eq(notifications.userId, userId),
-          beforeDate ? lt(notifications.createdAt, beforeDate) : undefined,
-          unreadOnly ? eq(notifications.isRead, false) : undefined,
-        ),
-      )
-      .orderBy(desc(notifications.createdAt))
-      .limit(limit);
+    if (beforeDate && Number.isNaN(beforeDate.getTime())) {
+      throw new BadRequestException('before cursor is invalid.');
+    }
 
-    const oldestNotification = rows.at(rows.length - 1) ?? null;
+    return this.appCacheService.getOrSet(
+      this.getNotificationsListCacheKey(userId, limit, beforeDate, unreadOnly),
+      NOTIFICATIONS_LIST_CACHE_TTL_SECONDS,
+      async () => {
+        const rows = await this.db
+          .select({
+            id: notifications.id,
+            type: notifications.type,
+            title: notifications.title,
+            body: notifications.body,
+            data: notifications.data,
+            isRead: notifications.isRead,
+            readAt: notifications.readAt,
+            createdAt: notifications.createdAt,
+          })
+          .from(notifications)
+          .where(
+            and(
+              eq(notifications.userId, userId),
+              beforeDate ? lt(notifications.createdAt, beforeDate) : undefined,
+              unreadOnly ? eq(notifications.isRead, false) : undefined,
+            ),
+          )
+          .orderBy(desc(notifications.createdAt))
+          .limit(limit);
 
-    return {
-      count: rows.length,
-      notifications: rows,
-      nextCursor: oldestNotification?.createdAt.toISOString() ?? null,
-    };
+        const oldestNotification = rows.at(rows.length - 1) ?? null;
+
+        return {
+          count: rows.length,
+          notifications: rows,
+          nextCursor: oldestNotification?.createdAt.toISOString() ?? null,
+        };
+      },
+    );
   }
 
   async markAsRead(userId: string, notificationId: string) {
@@ -96,6 +115,8 @@ export class NotificationsService {
       throw new NotFoundException('Notification not found.');
     }
 
+    await this.invalidateNotificationsListCache(userId);
+
     return updated;
   }
 
@@ -112,6 +133,8 @@ export class NotificationsService {
       .returning({
         id: notifications.id,
       });
+
+    await this.invalidateNotificationsListCache(userId);
 
     return {
       updatedCount: rows.length,
@@ -157,6 +180,15 @@ export class NotificationsService {
   }
 
   async notifyMatchCreated(matchId: string, user1Id: string, user2Id: string) {
+    const isBlocked = await this.blocksService.isEitherUserBlocked(
+      user1Id,
+      user2Id,
+    );
+
+    if (isBlocked) {
+      return;
+    }
+
     const participants = await this.db
       .select({
         id: users.id,
@@ -213,6 +245,15 @@ export class NotificationsService {
     previewText: string;
   }) {
     if (input.recipientUserId === input.senderUserId) {
+      return;
+    }
+
+    const isBlocked = await this.blocksService.isEitherUserBlocked(
+      input.recipientUserId,
+      input.senderUserId,
+    );
+
+    if (isBlocked) {
       return;
     }
 
@@ -298,7 +339,33 @@ export class NotificationsService {
       });
     }
 
+    await this.invalidateNotificationsListCache(created.userId);
+
     return created;
+  }
+
+  private async invalidateNotificationsListCache(
+    userId: string,
+  ): Promise<void> {
+    await this.appCacheService.delByPrefix(
+      this.getNotificationsListCachePrefix(userId),
+    );
+  }
+
+  private getNotificationsListCacheKey(
+    userId: string,
+    limit: number,
+    beforeDate: Date | null,
+    unreadOnly: boolean,
+  ): string {
+    const cursor = beforeDate ? beforeDate.toISOString() : 'none';
+    const unreadOnlyKey = unreadOnly ? '1' : '0';
+
+    return `notifications:list:${userId}:${limit}:${cursor}:${unreadOnlyKey}`;
+  }
+
+  private getNotificationsListCachePrefix(userId: string): string {
+    return `notifications:list:${userId}:`;
   }
 
   private async ensureUserExists(userId: string): Promise<void> {

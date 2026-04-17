@@ -37,6 +37,18 @@ export const envSchema = z.object({
   REDIS_PORT: z.coerce.number().int().positive().default(6379),
   REDIS_PASSWORD: z.string().default(''),
   REDIS_DB: z.coerce.number().int().nonnegative().default(0),
+  RATE_LIMIT_TTL_MS: z.coerce.number().int().positive().default(60_000),
+  RATE_LIMIT_MAX: z.coerce.number().int().positive().default(120),
+  RATE_LIMIT_BLOCK_DURATION_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(60_000),
+  CACHE_ENABLED: envBoolean.default(true),
+  CACHE_DEFAULT_TTL_SECONDS: z.coerce.number().int().positive().default(30),
+  CACHE_MEMORY_MAX_KEYS: z.coerce.number().int().positive().default(5_000),
+  CACHE_REDIS_ENABLED: envBoolean.default(false),
+  CACHE_REDIS_PREFIX: z.string().min(1).default('matchmaker:cache'),
   NOTIFICATIONS_QUEUE_ENABLED: envBoolean.default(false),
   PUSH_DELIVERY_ENABLED: envBoolean.default(false),
   ONESIGNAL_APP_ID: z.string().min(1).optional(),

@@ -4,48 +4,60 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { and, asc, desc, eq, isNull, sql } from 'drizzle-orm';
+import { AppCacheService } from '../../common/performance/app-cache.service';
 import { DatabaseService } from '../../database/database.service';
 import { referrals, userPhotos, users } from '../../database/schema';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 
+const USER_ME_CACHE_TTL_SECONDS = 30;
+
 @Injectable()
 export class UsersService {
-  constructor(private readonly databaseService: DatabaseService) {}
+  constructor(
+    private readonly appCacheService: AppCacheService,
+    private readonly databaseService: DatabaseService,
+  ) {}
 
   private get db() {
     return this.databaseService.db;
   }
 
   async getMe(userId: string) {
-    const [user] = await this.db
-      .select({
-        id: users.id,
-        email: users.email,
-        firstName: users.firstName,
-        lastName: users.lastName,
-        birthDate: users.birthDate,
-        gender: users.gender,
-        bio: users.bio,
-        referralCode: users.referralCode,
-        referredBy: users.referredBy,
-        isVerified: users.isVerified,
-        isFrozen: users.isFrozen,
-        subscriptionTier: users.subscriptionTier,
-        createdAt: users.createdAt,
-        updatedAt: users.updatedAt,
-      })
-      .from(users)
-      .where(and(eq(users.id, userId), isNull(users.deletedAt)))
-      .limit(1);
+    return this.appCacheService.getOrSet(
+      this.getMeCacheKey(userId),
+      USER_ME_CACHE_TTL_SECONDS,
+      async () => {
+        const [user] = await this.db
+          .select({
+            id: users.id,
+            email: users.email,
+            firstName: users.firstName,
+            lastName: users.lastName,
+            birthDate: users.birthDate,
+            gender: users.gender,
+            bio: users.bio,
+            referralCode: users.referralCode,
+            referredBy: users.referredBy,
+            isVerified: users.isVerified,
+            isFrozen: users.isFrozen,
+            subscriptionTier: users.subscriptionTier,
+            createdAt: users.createdAt,
+            updatedAt: users.updatedAt,
+          })
+          .from(users)
+          .where(and(eq(users.id, userId), isNull(users.deletedAt)))
+          .limit(1);
 
-    if (!user) {
-      throw new NotFoundException('User not found.');
-    }
+        if (!user) {
+          throw new NotFoundException('User not found.');
+        }
 
-    return {
-      ...user,
-      photos: await this.getPhotosByUserId(userId),
-    };
+        return {
+          ...user,
+          photos: await this.getPhotosByUserId(userId),
+        };
+      },
+    );
   }
 
   async getMyReferralCode(userId: string) {
@@ -135,6 +147,8 @@ export class UsersService {
       await this.db.update(users).set(values).where(eq(users.id, userId));
     }
 
+    await this.invalidateUserProfileCache(userId);
+
     return this.getMe(userId);
   }
 
@@ -164,6 +178,8 @@ export class UsersService {
         createdAt: userPhotos.createdAt,
       });
 
+    await this.invalidateUserProfileCache(userId);
+
     return photo;
   }
 
@@ -185,6 +201,7 @@ export class UsersService {
 
     await this.db.delete(userPhotos).where(eq(userPhotos.id, photo.id));
     await this.reindexPhotoPositions(userId);
+    await this.invalidateUserProfileCache(userId);
 
     return photo;
   }
@@ -218,6 +235,8 @@ export class UsersService {
       }
     });
 
+    await this.invalidateUserProfileCache(userId);
+
     return this.getPhotosByUserId(userId);
   }
 
@@ -232,6 +251,8 @@ export class UsersService {
         updatedAt: new Date(),
       })
       .where(eq(users.id, userId));
+
+    await this.invalidateUserProfileCache(userId);
 
     return { message: 'Account frozen successfully.' };
   }
@@ -248,6 +269,8 @@ export class UsersService {
       })
       .where(eq(users.id, userId));
 
+    await this.invalidateUserProfileCache(userId);
+
     return { message: 'Account unfrozen successfully.' };
   }
 
@@ -262,6 +285,8 @@ export class UsersService {
         updatedAt: new Date(),
       })
       .where(eq(users.id, userId));
+
+    await this.invalidateUserProfileCache(userId);
 
     return { message: 'Account deleted successfully.' };
   }
@@ -292,6 +317,14 @@ export class UsersService {
           );
       }
     });
+  }
+
+  private async invalidateUserProfileCache(userId: string): Promise<void> {
+    await this.appCacheService.del(this.getMeCacheKey(userId));
+  }
+
+  private getMeCacheKey(userId: string): string {
+    return `users:me:${userId}`;
   }
 
   private async ensureUserExists(userId: string): Promise<void> {

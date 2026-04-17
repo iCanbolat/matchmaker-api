@@ -29,6 +29,12 @@ export const swipes = pgTable(
       table.swiperId,
       table.swipedId,
     ),
+    index('idx_swipes_swiper_direction_active_created').on(
+      table.swiperId,
+      table.direction,
+      table.isUndone,
+      table.createdAt,
+    ),
     index('idx_swipes_swiper_created').on(table.swiperId, table.createdAt),
     index('idx_swipes_swiper_undone').on(table.swiperId, table.undoneAt),
     index('idx_swipes_swiped').on(table.swipedId, table.direction),

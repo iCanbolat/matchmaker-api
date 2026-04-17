@@ -3,9 +3,21 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { and, asc, desc, eq, gte, inArray, isNull, sql } from 'drizzle-orm';
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gte,
+  inArray,
+  isNull,
+  notInArray,
+  sql,
+} from 'drizzle-orm';
+import { AppCacheService } from '../../common/performance/app-cache.service';
 import { DatabaseService } from '../../database/database.service';
 import { profileViews, userPhotos, users } from '../../database/schema';
+import { BlocksService } from '../blocks/blocks.service';
 import { SubscriptionPolicyService } from '../subscriptions/subscription-policy.service';
 
 type SelectClient = {
@@ -20,10 +32,14 @@ type ReadWriteClient = SelectClient & InsertClient;
 
 const DEFAULT_PROFILE_VIEWS_LIMIT = 20;
 const MAX_PROFILE_VIEWS_LIMIT = 100;
+const PROFILE_VIEWS_LIST_CACHE_TTL_SECONDS = 15;
+const PROFILE_VIEWS_COUNT_CACHE_TTL_SECONDS = 10;
 
 @Injectable()
 export class ProfileViewsService {
   constructor(
+    private readonly appCacheService: AppCacheService,
+    private readonly blocksService: BlocksService,
     private readonly databaseService: DatabaseService,
     private readonly subscriptionPolicyService: SubscriptionPolicyService,
   ) {}
@@ -47,73 +63,88 @@ export class ProfileViewsService {
 
     const limit = this.resolveLimit(requestedLimit);
 
-    const rows = await this.db
-      .select({
-        id: profileViews.id,
-        createdAt: profileViews.createdAt,
-        viewerId: users.id,
-        viewerFirstName: users.firstName,
-        viewerLastName: users.lastName,
-        viewerGender: users.gender,
-        viewerBirthDate: users.birthDate,
-      })
-      .from(profileViews)
-      .innerJoin(users, eq(users.id, profileViews.viewerId))
-      .where(
-        and(
-          eq(profileViews.viewedId, userId),
-          eq(users.isActive, true),
-          isNull(users.deletedAt),
-        ),
-      )
-      .orderBy(desc(profileViews.createdAt))
-      .limit(limit);
+    return this.appCacheService.getOrSet(
+      this.getProfileViewsListCacheKey(userId, limit),
+      PROFILE_VIEWS_LIST_CACHE_TTL_SECONDS,
+      async () => {
+        const blockedUserIds =
+          await this.blocksService.getBlockedRelationUserIds(userId);
 
-    if (rows.length === 0) {
-      return {
-        count: 0,
-        profileViews: [],
-      };
-    }
+        const rows = await this.db
+          .select({
+            id: profileViews.id,
+            createdAt: profileViews.createdAt,
+            viewerId: users.id,
+            viewerFirstName: users.firstName,
+            viewerLastName: users.lastName,
+            viewerGender: users.gender,
+            viewerBirthDate: users.birthDate,
+          })
+          .from(profileViews)
+          .innerJoin(users, eq(users.id, profileViews.viewerId))
+          .where(
+            and(
+              eq(profileViews.viewedId, userId),
+              eq(users.isActive, true),
+              isNull(users.deletedAt),
+              blockedUserIds.length > 0
+                ? notInArray(users.id, blockedUserIds)
+                : undefined,
+            ),
+          )
+          .orderBy(desc(profileViews.createdAt))
+          .limit(limit);
 
-    const viewerIds = Array.from(new Set(rows.map((row) => row.viewerId)));
-    const photos = await this.db
-      .select({
-        id: userPhotos.id,
-        userId: userPhotos.userId,
-        url: userPhotos.url,
-        position: userPhotos.position,
-      })
-      .from(userPhotos)
-      .where(inArray(userPhotos.userId, viewerIds))
-      .orderBy(asc(userPhotos.position), asc(userPhotos.createdAt));
+        if (rows.length === 0) {
+          return {
+            count: 0,
+            profileViews: [],
+          };
+        }
 
-    const firstPhotoByUserId = new Map<string, { id: string; url: string }>();
+        const viewerIds = Array.from(new Set(rows.map((row) => row.viewerId)));
+        const photos = await this.db
+          .select({
+            id: userPhotos.id,
+            userId: userPhotos.userId,
+            url: userPhotos.url,
+            position: userPhotos.position,
+          })
+          .from(userPhotos)
+          .where(inArray(userPhotos.userId, viewerIds))
+          .orderBy(asc(userPhotos.position), asc(userPhotos.createdAt));
 
-    for (const photo of photos) {
-      if (!firstPhotoByUserId.has(photo.userId)) {
-        firstPhotoByUserId.set(photo.userId, {
-          id: photo.id,
-          url: photo.url,
-        });
-      }
-    }
+        const firstPhotoByUserId = new Map<
+          string,
+          { id: string; url: string }
+        >();
 
-    return {
-      count: rows.length,
-      profileViews: rows.map((row) => ({
-        id: row.id,
-        createdAt: row.createdAt,
-        viewer: {
-          id: row.viewerId,
-          firstName: row.viewerFirstName,
-          lastName: row.viewerLastName,
-          gender: row.viewerGender,
-          age: this.calculateAge(row.viewerBirthDate),
-          photo: firstPhotoByUserId.get(row.viewerId) ?? null,
-        },
-      })),
-    };
+        for (const photo of photos) {
+          if (!firstPhotoByUserId.has(photo.userId)) {
+            firstPhotoByUserId.set(photo.userId, {
+              id: photo.id,
+              url: photo.url,
+            });
+          }
+        }
+
+        return {
+          count: rows.length,
+          profileViews: rows.map((row) => ({
+            id: row.id,
+            createdAt: row.createdAt,
+            viewer: {
+              id: row.viewerId,
+              firstName: row.viewerFirstName,
+              lastName: row.viewerLastName,
+              gender: row.viewerGender,
+              age: this.calculateAge(row.viewerBirthDate),
+              photo: firstPhotoByUserId.get(row.viewerId) ?? null,
+            },
+          })),
+        };
+      },
+    );
   }
 
   async getProfileViewsCount(userId: string) {
@@ -123,14 +154,33 @@ export class ProfileViewsService {
       user.subscriptionExpiresAt,
     );
 
-    const [countRow] = await this.db
-      .select({
-        count: sql<number>`count(*)`,
-      })
-      .from(profileViews)
-      .where(eq(profileViews.viewedId, userId));
+    const count = await this.appCacheService.getOrSet(
+      this.getProfileViewsCountCacheKey(userId),
+      PROFILE_VIEWS_COUNT_CACHE_TTL_SECONDS,
+      async () => {
+        const blockedUserIds =
+          await this.blocksService.getBlockedRelationUserIds(userId);
 
-    const count = Number(countRow?.count ?? 0);
+        const [countRow] = await this.db
+          .select({
+            count: sql<number>`count(*)`,
+          })
+          .from(profileViews)
+          .innerJoin(users, eq(users.id, profileViews.viewerId))
+          .where(
+            and(
+              eq(profileViews.viewedId, userId),
+              eq(users.isActive, true),
+              isNull(users.deletedAt),
+              blockedUserIds.length > 0
+                ? notInArray(profileViews.viewerId, blockedUserIds)
+                : undefined,
+            ),
+          );
+
+        return Number(countRow?.count ?? 0);
+      },
+    );
 
     return {
       count,
@@ -224,6 +274,14 @@ export class ProfileViewsService {
     }
 
     return Math.min(Math.max(requestedLimit, 1), MAX_PROFILE_VIEWS_LIMIT);
+  }
+
+  private getProfileViewsListCacheKey(userId: string, limit: number): string {
+    return `profile-views:list:${userId}:${limit}`;
+  }
+
+  private getProfileViewsCountCacheKey(userId: string): string {
+    return `profile-views:count:${userId}`;
   }
 
   private getUtcDayStart(): Date {

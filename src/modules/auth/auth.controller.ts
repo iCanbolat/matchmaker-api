@@ -1,4 +1,5 @@
 import { Body, Controller, Post, UseGuards } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { type AuthenticatedUser } from '../../common/types/authenticated-user.type';
@@ -8,31 +9,70 @@ import { RegisterDto } from './dto/register.dto';
 import { SocialAuthDto } from './dto/social-auth.dto';
 import { AuthService } from './auth.service';
 
+const ONE_MINUTE_IN_MS = 60_000;
+const TWO_MINUTES_IN_MS = 120_000;
+const FIVE_MINUTES_IN_MS = 300_000;
+
 @Controller('auth')
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
   @Post('register')
+  @Throttle({
+    default: {
+      limit: 3,
+      ttl: ONE_MINUTE_IN_MS,
+      blockDuration: FIVE_MINUTES_IN_MS,
+    },
+  })
   register(@Body() dto: RegisterDto) {
     return this.authService.register(dto);
   }
 
   @Post('login')
+  @Throttle({
+    default: {
+      limit: 6,
+      ttl: ONE_MINUTE_IN_MS,
+      blockDuration: TWO_MINUTES_IN_MS,
+    },
+  })
   login(@Body() dto: LoginDto) {
     return this.authService.login(dto);
   }
 
   @Post('google')
+  @Throttle({
+    default: {
+      limit: 15,
+      ttl: ONE_MINUTE_IN_MS,
+      blockDuration: TWO_MINUTES_IN_MS,
+    },
+  })
   authenticateWithGoogle(@Body() dto: SocialAuthDto) {
     return this.authService.authenticateWithGoogle(dto);
   }
 
   @Post('apple')
+  @Throttle({
+    default: {
+      limit: 15,
+      ttl: ONE_MINUTE_IN_MS,
+      blockDuration: TWO_MINUTES_IN_MS,
+    },
+  })
   authenticateWithApple(@Body() dto: SocialAuthDto) {
     return this.authService.authenticateWithApple(dto);
   }
 
   @Post('refresh')
+  @Throttle({
+    default: {
+      limit: 30,
+      ttl: ONE_MINUTE_IN_MS,
+      blockDuration: ONE_MINUTE_IN_MS,
+    },
+  })
   refresh(@Body() dto: RefreshTokenDto) {
     return this.authService.refresh(dto.refreshToken);
   }

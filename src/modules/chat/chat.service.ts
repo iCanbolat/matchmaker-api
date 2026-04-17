@@ -11,6 +11,7 @@ import {
   or,
   sql,
 } from 'drizzle-orm';
+import { BlocksService } from '../blocks/blocks.service';
 import { DatabaseService } from '../../database/database.service';
 import {
   conversations,
@@ -39,7 +40,10 @@ type ConversationMembership = {
 
 @Injectable()
 export class ChatService {
-  constructor(private readonly databaseService: DatabaseService) {}
+  constructor(
+    private readonly blocksService: BlocksService,
+    private readonly databaseService: DatabaseService,
+  ) {}
 
   private get db() {
     return this.databaseService.db;
@@ -78,7 +82,22 @@ export class ChatService {
       )
       .limit(limit);
 
-    if (conversationRows.length === 0) {
+    const blockedUserIds = new Set(
+      await this.blocksService.getBlockedRelationUserIds(userId),
+    );
+    const visibleConversations =
+      blockedUserIds.size > 0
+        ? conversationRows.filter((conversation) => {
+            const counterpartId =
+              conversation.user1Id === userId
+                ? conversation.user2Id
+                : conversation.user1Id;
+
+            return !blockedUserIds.has(counterpartId);
+          })
+        : conversationRows;
+
+    if (visibleConversations.length === 0) {
       return {
         count: 0,
         conversations: [],
@@ -87,14 +106,14 @@ export class ChatService {
 
     const counterpartIds = Array.from(
       new Set(
-        conversationRows.map((conversation) =>
+        visibleConversations.map((conversation) =>
           conversation.user1Id === userId
             ? conversation.user2Id
             : conversation.user1Id,
         ),
       ),
     );
-    const conversationIds = conversationRows.map(
+    const conversationIds = visibleConversations.map(
       (conversation) => conversation.id,
     );
 
@@ -172,7 +191,7 @@ export class ChatService {
       }
     }
 
-    const items = conversationRows
+    const items = visibleConversations
       .map((conversation) => {
         const counterpartId =
           conversation.user1Id === userId
@@ -363,6 +382,19 @@ export class ChatService {
       .limit(1);
 
     if (!conversation) {
+      throw new NotFoundException('Conversation not found.');
+    }
+
+    const counterpartId =
+      conversation.user1Id === userId
+        ? conversation.user2Id
+        : conversation.user1Id;
+    const isBlocked = await this.blocksService.isEitherUserBlocked(
+      userId,
+      counterpartId,
+    );
+
+    if (isBlocked) {
       throw new NotFoundException('Conversation not found.');
     }
 

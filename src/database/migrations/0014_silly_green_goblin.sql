@@ -1,0 +1,3 @@
+CREATE INDEX "idx_swipes_swiper_direction_active_created" ON "swipes" USING btree ("swiper_id","direction","is_undone","created_at");--> statement-breakpoint
+CREATE INDEX "idx_notifications_user_created" ON "notifications" USING btree ("user_id","created_at");--> statement-breakpoint
+CREATE INDEX "idx_user_boosts_user_active_window" ON "user_boosts" USING btree ("user_id","starts_at","expires_at");
