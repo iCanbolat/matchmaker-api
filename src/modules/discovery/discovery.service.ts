@@ -10,20 +10,19 @@ import {
   conversations,
   matches,
   swipes,
+  userBoosts,
   userPhotos,
   users,
 } from '../../database/schema';
 import { NotificationsService } from '../notifications/notifications.service';
+import { ProfileViewsService } from '../profile-views/profile-views.service';
 import { ReferralBonusService } from '../referrals/referral-bonus.service';
+import { SubscriptionPolicyService } from '../subscriptions/subscription-policy.service';
 import {
   type SwipeDirection,
   type SwipeDto,
   SWIPE_DIRECTIONS,
 } from './dto/swipe.dto';
-
-type SubscriptionTier = 'free' | 'plus' | 'premium';
-
-type DailySwipeLimit = number | null;
 
 type DiscoveryCard = {
   id: string;
@@ -32,6 +31,7 @@ type DiscoveryCard = {
   age: number;
   gender: string;
   bio: string | null;
+  isBoosted: boolean;
   photos: Array<{
     id: string;
     url: string;
@@ -54,20 +54,16 @@ type MatchCreationResult = {
 type TransactionClient = {
   select: DatabaseService['db']['select'];
   insert: DatabaseService['db']['insert'];
+  update: DatabaseService['db']['update'];
 };
 
-const DAILY_SWIPE_LIMITS: Record<SubscriptionTier, DailySwipeLimit> = {
-  free: 20,
-  plus: 100,
-  premium: null,
+type SelectClient = {
+  select: DatabaseService['db']['select'];
 };
 
 const DEFAULT_DISCOVERY_CARDS_LIMIT = 20;
 const MAX_DISCOVERY_CARDS_LIMIT = 50;
-const COUNTED_SWIPE_DIRECTIONS: Array<(typeof SWIPE_DIRECTIONS)[number]> = [
-  'like',
-  'super_like',
-];
+const BOOST_DURATION_MINUTES = 30;
 const MATCH_TRIGGER_DIRECTIONS: Array<(typeof SWIPE_DIRECTIONS)[number]> = [
   'like',
   'super_like',
@@ -79,6 +75,8 @@ export class DiscoveryService {
     private readonly databaseService: DatabaseService,
     private readonly referralBonusService: ReferralBonusService,
     private readonly notificationsService: NotificationsService,
+    private readonly profileViewsService: ProfileViewsService,
+    private readonly subscriptionPolicyService: SubscriptionPolicyService,
   ) {}
 
   private get db() {
@@ -90,6 +88,15 @@ export class DiscoveryService {
     requestedLimit?: number,
   ): Promise<{ count: number; cards: DiscoveryCard[] }> {
     const limit = this.resolveCardsLimit(requestedLimit);
+    const boostRank = sql<number>`
+      case when exists (
+        select 1
+        from user_boosts ub
+        where ub.user_id = ${users.id}
+          and ub.starts_at <= now()
+          and ub.expires_at > now()
+      ) then 1 else 0 end
+    `;
 
     await this.assertUserCanUseDiscovery(userId);
 
@@ -101,6 +108,7 @@ export class DiscoveryService {
         birthDate: users.birthDate,
         gender: users.gender,
         bio: users.bio,
+        boostRank,
       })
       .from(users)
       .where(
@@ -119,7 +127,7 @@ export class DiscoveryService {
           )`,
         ),
       )
-      .orderBy(desc(users.createdAt))
+      .orderBy(desc(boostRank), desc(users.createdAt))
       .limit(limit);
 
     if (candidates.length === 0) {
@@ -165,6 +173,7 @@ export class DiscoveryService {
       age: this.calculateAge(candidate.birthDate),
       gender: candidate.gender,
       bio: candidate.bio,
+      isBoosted: Number(candidate.boostRank ?? 0) > 0,
       photos: photosByUserId.get(candidate.id) ?? [],
     }));
 
@@ -218,31 +227,26 @@ export class DiscoveryService {
         throw new NotFoundException('Target user not found.');
       }
 
-      const effectiveTier = this.resolveEffectiveTier(
+      const effectiveTier = this.subscriptionPolicyService.resolveEffectiveTier(
         swiper.subscriptionTier,
         swiper.subscriptionExpiresAt,
       );
-      const dailySwipeLimit = DAILY_SWIPE_LIMITS[effectiveTier];
+      const limits =
+        this.subscriptionPolicyService.getLimitsForTier(effectiveTier);
+      const dailyLikeLimit = limits.dailyLikeLimit;
+      const dailySuperLikeLimit = limits.dailySuperLikeLimit;
       let usedReferralCredit = false;
+      let todayLikeCount: number | null = null;
+      let todaySuperLikeCount: number | null = null;
 
-      if (this.isCountedDirection(dto.direction) && dailySwipeLimit !== null) {
-        const [todaySwipeCountRow] = await tx
-          .select({
-            count: sql<number>`count(*)`,
-          })
-          .from(swipes)
-          .where(
-            and(
-              eq(swipes.swiperId, swiperId),
-              eq(swipes.isUndone, false),
-              gte(swipes.createdAt, this.getUtcDayStart()),
-              inArray(swipes.direction, this.getCountedDirections()),
-            ),
-          );
+      if (dto.direction === 'like' && dailyLikeLimit !== null) {
+        todayLikeCount = await this.countTodaySwipeByDirection(
+          tx,
+          swiperId,
+          'like',
+        );
 
-        const todaySwipeCount = Number(todaySwipeCountRow?.count ?? 0);
-
-        if (todaySwipeCount >= dailySwipeLimit) {
+        if (todayLikeCount >= dailyLikeLimit) {
           usedReferralCredit =
             await this.referralBonusService.consumeSwipeCredit(tx, swiperId);
 
@@ -254,24 +258,85 @@ export class DiscoveryService {
         }
       }
 
-      const [swipe] = await tx
-        .insert(swipes)
-        .values({
+      if (dto.direction === 'super_like' && dailySuperLikeLimit !== null) {
+        todaySuperLikeCount = await this.countTodaySwipeByDirection(
+          tx,
           swiperId,
-          swipedId: dto.swipedUserId,
-          direction: dto.direction,
-          isUndone: false,
-        })
-        .onConflictDoNothing()
-        .returning({
+          'super_like',
+        );
+
+        if (todaySuperLikeCount >= dailySuperLikeLimit) {
+          throw new ForbiddenException(
+            'Daily super like limit reached. Upgrade your subscription to increase limits.',
+          );
+        }
+      }
+
+      await this.profileViewsService.recordView(swiperId, dto.swipedUserId, tx);
+
+      const [existingSwipe] = await tx
+        .select({
           id: swipes.id,
-          swipedUserId: swipes.swipedId,
-          direction: swipes.direction,
-          createdAt: swipes.createdAt,
-        });
+          isUndone: swipes.isUndone,
+        })
+        .from(swipes)
+        .where(
+          and(
+            eq(swipes.swiperId, swiperId),
+            eq(swipes.swipedId, dto.swipedUserId),
+          ),
+        )
+        .limit(1);
+
+      let swipe:
+        | {
+            id: string;
+            swipedUserId: string;
+            direction: string;
+            createdAt: Date;
+          }
+        | undefined;
+
+      if (!existingSwipe) {
+        [swipe] = await tx
+          .insert(swipes)
+          .values({
+            swiperId,
+            swipedId: dto.swipedUserId,
+            direction: dto.direction,
+            isUndone: false,
+            undoneAt: null,
+          })
+          .returning({
+            id: swipes.id,
+            swipedUserId: swipes.swipedId,
+            direction: swipes.direction,
+            createdAt: swipes.createdAt,
+          });
+      } else {
+        if (!existingSwipe.isUndone) {
+          throw new BadRequestException('You have already swiped this user.');
+        }
+
+        [swipe] = await tx
+          .update(swipes)
+          .set({
+            direction: dto.direction,
+            isUndone: false,
+            undoneAt: null,
+            createdAt: new Date(),
+          })
+          .where(eq(swipes.id, existingSwipe.id))
+          .returning({
+            id: swipes.id,
+            swipedUserId: swipes.swipedId,
+            direction: swipes.direction,
+            createdAt: swipes.createdAt,
+          });
+      }
 
       if (!swipe) {
-        throw new BadRequestException('You have already swiped this user.');
+        throw new BadRequestException('Failed to save swipe.');
       }
 
       const matchResult = await this.tryCreateMatch(
@@ -290,7 +355,11 @@ export class DiscoveryService {
         matchCreated: matchResult.created,
         limit: {
           tier: effectiveTier,
-          dailySwipeLimit,
+          dailyLikeLimit,
+          dailySuperLikeLimit,
+          dailySwipeLimit: dailyLikeLimit,
+          todayLikeCount,
+          todaySuperLikeCount,
           usedReferralCredit,
           remainingSwipeCredits,
         },
@@ -308,6 +377,212 @@ export class DiscoveryService {
     }
 
     return publicResult;
+  }
+
+  async rewind(userId: string) {
+    return this.db.transaction(async (tx) => {
+      const [user] = await tx
+        .select({
+          id: users.id,
+          subscriptionTier: users.subscriptionTier,
+          subscriptionExpiresAt: users.subscriptionExpiresAt,
+        })
+        .from(users)
+        .where(
+          and(
+            eq(users.id, userId),
+            isNull(users.deletedAt),
+            eq(users.isActive, true),
+            eq(users.isFrozen, false),
+          ),
+        )
+        .limit(1);
+
+      if (!user) {
+        throw new NotFoundException('User not found.');
+      }
+
+      const effectiveTier = this.subscriptionPolicyService.resolveEffectiveTier(
+        user.subscriptionTier,
+        user.subscriptionExpiresAt,
+      );
+      const limits =
+        this.subscriptionPolicyService.getLimitsForTier(effectiveTier);
+      const dailyRewindLimit = limits.dailyRewindLimit;
+
+      const todayRewindCount =
+        dailyRewindLimit === null
+          ? 0
+          : await this.countTodayRewinds(tx, userId);
+
+      if (dailyRewindLimit !== null && todayRewindCount >= dailyRewindLimit) {
+        throw new ForbiddenException(
+          'Daily rewind limit reached. Upgrade your subscription to increase limits.',
+        );
+      }
+
+      const [lastSwipe] = await tx
+        .select({
+          id: swipes.id,
+          swipedUserId: swipes.swipedId,
+          direction: swipes.direction,
+          createdAt: swipes.createdAt,
+        })
+        .from(swipes)
+        .where(and(eq(swipes.swiperId, userId), eq(swipes.isUndone, false)))
+        .orderBy(desc(swipes.createdAt))
+        .limit(1);
+
+      if (!lastSwipe) {
+        throw new NotFoundException('No swipe available to rewind.');
+      }
+
+      const now = new Date();
+
+      const [rewound] = await tx
+        .update(swipes)
+        .set({
+          isUndone: true,
+          undoneAt: now,
+        })
+        .where(eq(swipes.id, lastSwipe.id))
+        .returning({
+          id: swipes.id,
+        });
+
+      if (!rewound) {
+        throw new BadRequestException('Failed to rewind swipe.');
+      }
+
+      const remainingSwipeCredits =
+        await this.referralBonusService.getRemainingSwipeCredits(tx, userId);
+      const updatedTodayRewindCount =
+        dailyRewindLimit === null ? null : todayRewindCount + 1;
+
+      return {
+        rewoundSwipe: {
+          id: lastSwipe.id,
+          swipedUserId: lastSwipe.swipedUserId,
+          direction: lastSwipe.direction,
+          createdAt: lastSwipe.createdAt,
+          rewoundAt: now,
+        },
+        limit: {
+          tier: effectiveTier,
+          dailyRewindLimit,
+          todayRewindCount: updatedTodayRewindCount,
+          dailyRewindRemaining:
+            dailyRewindLimit === null
+              ? null
+              : Math.max(dailyRewindLimit - (todayRewindCount + 1), 0),
+          remainingSwipeCredits,
+        },
+      };
+    });
+  }
+
+  async boost(userId: string) {
+    return this.db.transaction(async (tx) => {
+      const [user] = await tx
+        .select({
+          id: users.id,
+          subscriptionTier: users.subscriptionTier,
+          subscriptionExpiresAt: users.subscriptionExpiresAt,
+        })
+        .from(users)
+        .where(
+          and(
+            eq(users.id, userId),
+            isNull(users.deletedAt),
+            eq(users.isActive, true),
+            eq(users.isFrozen, false),
+          ),
+        )
+        .limit(1);
+
+      if (!user) {
+        throw new NotFoundException('User not found.');
+      }
+
+      const effectiveTier = this.subscriptionPolicyService.resolveEffectiveTier(
+        user.subscriptionTier,
+        user.subscriptionExpiresAt,
+      );
+      const limits =
+        this.subscriptionPolicyService.getLimitsForTier(effectiveTier);
+      const monthlyBoostLimit = limits.monthlyBoostLimit;
+
+      if (monthlyBoostLimit <= 0) {
+        throw new ForbiddenException(
+          'Boost is available for Plus and Premium members only.',
+        );
+      }
+
+      const monthBoostCount = await this.countCurrentMonthBoosts(tx, userId);
+
+      if (monthBoostCount >= monthlyBoostLimit) {
+        throw new ForbiddenException(
+          'Monthly boost limit reached. Upgrade your subscription to increase limits.',
+        );
+      }
+
+      const now = new Date();
+      const [activeBoost] = await tx
+        .select({
+          id: userBoosts.id,
+          startsAt: userBoosts.startsAt,
+          expiresAt: userBoosts.expiresAt,
+        })
+        .from(userBoosts)
+        .where(
+          and(
+            eq(userBoosts.userId, userId),
+            sql`${userBoosts.startsAt} <= ${now}`,
+            gte(userBoosts.expiresAt, now),
+          ),
+        )
+        .orderBy(desc(userBoosts.expiresAt))
+        .limit(1);
+
+      if (activeBoost && activeBoost.expiresAt > now) {
+        throw new BadRequestException('You already have an active boost.');
+      }
+
+      const expiresAt = new Date(
+        now.getTime() + BOOST_DURATION_MINUTES * 60_000,
+      );
+
+      const [createdBoost] = await tx
+        .insert(userBoosts)
+        .values({
+          userId,
+          startsAt: now,
+          expiresAt,
+        })
+        .returning({
+          id: userBoosts.id,
+          startsAt: userBoosts.startsAt,
+          expiresAt: userBoosts.expiresAt,
+          createdAt: userBoosts.createdAt,
+        });
+
+      if (!createdBoost) {
+        throw new BadRequestException('Failed to activate boost.');
+      }
+
+      return {
+        boost: createdBoost,
+        limit: {
+          tier: effectiveTier,
+          monthlyBoostLimit,
+          monthBoostCount: monthBoostCount + 1,
+          monthlyBoostRemaining: Math.max(
+            monthlyBoostLimit - (monthBoostCount + 1),
+            0,
+          ),
+        },
+      };
+    });
   }
 
   async getSwipeLimitStatus(userId: string) {
@@ -332,60 +607,57 @@ export class DiscoveryService {
       throw new NotFoundException('User not found.');
     }
 
-    const effectiveTier = this.resolveEffectiveTier(
+    const effectiveTier = this.subscriptionPolicyService.resolveEffectiveTier(
       user.subscriptionTier,
       user.subscriptionExpiresAt,
     );
-    const dailySwipeLimit = DAILY_SWIPE_LIMITS[effectiveTier];
+    const limits =
+      this.subscriptionPolicyService.getLimitsForTier(effectiveTier);
+    const dailyLikeLimit = limits.dailyLikeLimit;
+    const dailySuperLikeLimit = limits.dailySuperLikeLimit;
 
-    let todaySwipeCount = 0;
-
-    if (dailySwipeLimit !== null) {
-      const [todaySwipeCountRow] = await this.db
-        .select({
-          count: sql<number>`count(*)`,
-        })
-        .from(swipes)
-        .where(
-          and(
-            eq(swipes.swiperId, userId),
-            eq(swipes.isUndone, false),
-            gte(swipes.createdAt, this.getUtcDayStart()),
-            inArray(swipes.direction, this.getCountedDirections()),
-          ),
-        );
-
-      todaySwipeCount = Number(todaySwipeCountRow?.count ?? 0);
-    }
+    const todayLikeCount =
+      dailyLikeLimit === null
+        ? 0
+        : await this.countTodaySwipeByDirection(this.db, userId, 'like');
+    const todaySuperLikeCount =
+      dailySuperLikeLimit === null
+        ? 0
+        : await this.countTodaySwipeByDirection(this.db, userId, 'super_like');
+    const monthBoostCount = await this.countCurrentMonthBoosts(this.db, userId);
 
     const remainingSwipeCredits =
       await this.referralBonusService.getRemainingSwipeCredits(this.db, userId);
 
     return {
       tier: effectiveTier,
-      dailySwipeLimit,
-      todaySwipeCount,
-      dailyRemaining:
-        dailySwipeLimit === null
+      dailyLikeLimit,
+      dailySuperLikeLimit,
+      dailyRewindLimit: limits.dailyRewindLimit,
+      monthlyBoostLimit: limits.monthlyBoostLimit,
+      dailySwipeLimit: dailyLikeLimit,
+      todayLikeCount,
+      todaySuperLikeCount,
+      monthBoostCount,
+      todaySwipeCount: todayLikeCount,
+      dailyLikeRemaining:
+        dailyLikeLimit === null
           ? null
-          : Math.max(dailySwipeLimit - todaySwipeCount, 0),
+          : Math.max(dailyLikeLimit - todayLikeCount, 0),
+      dailySuperLikeRemaining:
+        dailySuperLikeLimit === null
+          ? null
+          : Math.max(dailySuperLikeLimit - todaySuperLikeCount, 0),
+      dailyRemaining:
+        dailyLikeLimit === null
+          ? null
+          : Math.max(dailyLikeLimit - todayLikeCount, 0),
+      monthlyBoostRemaining:
+        limits.monthlyBoostLimit <= 0
+          ? 0
+          : Math.max(limits.monthlyBoostLimit - monthBoostCount, 0),
       referralSwipeCreditsRemaining: remainingSwipeCredits,
     };
-  }
-
-  private resolveEffectiveTier(
-    subscriptionTier: string,
-    subscriptionExpiresAt: Date | null,
-  ): SubscriptionTier {
-    if (subscriptionTier !== 'plus' && subscriptionTier !== 'premium') {
-      return 'free';
-    }
-
-    if (!subscriptionExpiresAt || subscriptionExpiresAt <= new Date()) {
-      return 'free';
-    }
-
-    return subscriptionTier;
   }
 
   private async tryCreateMatch(
@@ -550,16 +822,69 @@ export class DiscoveryService {
     return age;
   }
 
-  private isCountedDirection(direction: SwipeDirection): boolean {
-    return this.getCountedDirections().includes(direction);
-  }
-
   private isMatchTriggerDirection(direction: SwipeDirection): boolean {
     return this.getMatchTriggerDirections().includes(direction);
   }
 
-  private getCountedDirections(): Array<(typeof SWIPE_DIRECTIONS)[number]> {
-    return COUNTED_SWIPE_DIRECTIONS;
+  private async countTodaySwipeByDirection(
+    tx: SelectClient,
+    swiperId: string,
+    direction: SwipeDirection,
+  ): Promise<number> {
+    const [countRow] = await tx
+      .select({
+        count: sql<number>`count(*)`,
+      })
+      .from(swipes)
+      .where(
+        and(
+          eq(swipes.swiperId, swiperId),
+          eq(swipes.isUndone, false),
+          gte(swipes.createdAt, this.getUtcDayStart()),
+          eq(swipes.direction, direction),
+        ),
+      );
+
+    return Number(countRow?.count ?? 0);
+  }
+
+  private async countTodayRewinds(
+    tx: SelectClient,
+    swiperId: string,
+  ): Promise<number> {
+    const [countRow] = await tx
+      .select({
+        count: sql<number>`count(*)`,
+      })
+      .from(swipes)
+      .where(
+        and(
+          eq(swipes.swiperId, swiperId),
+          eq(swipes.isUndone, true),
+          gte(swipes.undoneAt, this.getUtcDayStart()),
+        ),
+      );
+
+    return Number(countRow?.count ?? 0);
+  }
+
+  private async countCurrentMonthBoosts(
+    tx: SelectClient,
+    userId: string,
+  ): Promise<number> {
+    const [countRow] = await tx
+      .select({
+        count: sql<number>`count(*)`,
+      })
+      .from(userBoosts)
+      .where(
+        and(
+          eq(userBoosts.userId, userId),
+          gte(userBoosts.createdAt, this.getUtcMonthStart()),
+        ),
+      );
+
+    return Number(countRow?.count ?? 0);
   }
 
   private getMatchTriggerDirections(): Array<
@@ -574,5 +899,11 @@ export class DiscoveryService {
     return new Date(
       Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
     );
+  }
+
+  private getUtcMonthStart(): Date {
+    const now = new Date();
+
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
   }
 }

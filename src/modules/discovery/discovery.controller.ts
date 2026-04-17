@@ -28,4 +28,14 @@ export class DiscoveryController {
   swipe(@CurrentUser() user: AuthenticatedUser, @Body() dto: SwipeDto) {
     return this.discoveryService.swipe(user.userId, dto);
   }
+
+  @Post('rewind')
+  rewind(@CurrentUser() user: AuthenticatedUser) {
+    return this.discoveryService.rewind(user.userId);
+  }
+
+  @Post('boost')
+  boost(@CurrentUser() user: AuthenticatedUser) {
+    return this.discoveryService.boost(user.userId);
+  }
 }

@@ -21,6 +21,7 @@ export const swipes = pgTable(
       .references(() => users.id, { onDelete: 'cascade' }),
     direction: varchar('direction', { length: 16 }).notNull(),
     isUndone: boolean('is_undone').notNull().default(false),
+    undoneAt: timestamp('undone_at'),
     createdAt: timestamp('created_at').notNull().defaultNow(),
   },
   (table) => [
@@ -29,6 +30,7 @@ export const swipes = pgTable(
       table.swipedId,
     ),
     index('idx_swipes_swiper_created').on(table.swiperId, table.createdAt),
+    index('idx_swipes_swiper_undone').on(table.swiperId, table.undoneAt),
     index('idx_swipes_swiped').on(table.swipedId, table.direction),
   ],
 );

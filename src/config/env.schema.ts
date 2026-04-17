@@ -64,6 +64,11 @@ export const envSchema = z.object({
   GOOGLE_CLIENT_ID: z.string().min(1).optional(),
   APPLE_CLIENT_ID: z.string().min(1).optional(),
 
+  APPLE_SHARED_SECRET: z.string().min(1).optional(),
+  GOOGLE_SERVICE_ACCOUNT_KEY: z.string().min(1).optional(),
+  GOOGLE_PLAY_PACKAGE_NAME: z.string().min(1).optional(),
+  SUBSCRIPTIONS_WEBHOOK_SECRET: z.string().min(1).optional(),
+
   UPLOAD_STRATEGY: z.enum(['local', 'bunny']).optional(),
   UPLOAD_DIR: z.string().default('uploads'),
   BUNNY_STORAGE_ZONE: z.string().optional(),

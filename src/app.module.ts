@@ -9,7 +9,9 @@ import { ChatModule } from './modules/chat/chat.module';
 import { DiscoveryModule } from './modules/discovery/discovery.module';
 import { MatchesModule } from './modules/matches/matches.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
+import { ProfileViewsModule } from './modules/profile-views/profile-views.module';
 import { SettingsModule } from './modules/settings/settings.module';
+import { SubscriptionsModule } from './modules/subscriptions/subscriptions.module';
 import { UsersModule } from './modules/users/users.module';
 import { VerificationModule } from './modules/verification/verification.module';
 
@@ -25,7 +27,9 @@ import { VerificationModule } from './modules/verification/verification.module';
     DiscoveryModule,
     MatchesModule,
     NotificationsModule,
+    ProfileViewsModule,
     SettingsModule,
+    SubscriptionsModule,
     UsersModule,
     VerificationModule,
   ],
