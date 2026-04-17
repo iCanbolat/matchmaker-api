@@ -5,3 +5,4 @@ export * from './system-settings';
 export * from './referrals';
 export * from './user-referral-credits';
 export * from './swipes';
+export * from './matches';

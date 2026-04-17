@@ -1,7 +1,8 @@
-import { Body, Controller, Get, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { type AuthenticatedUser } from '../../common/types/authenticated-user.type';
+import { GetDiscoveryCardsDto } from './dto/get-discovery-cards.dto';
 import { SwipeDto } from './dto/swipe.dto';
 import { DiscoveryService } from './discovery.service';
 
@@ -9,6 +10,14 @@ import { DiscoveryService } from './discovery.service';
 @UseGuards(JwtAuthGuard)
 export class DiscoveryController {
   constructor(private readonly discoveryService: DiscoveryService) {}
+
+  @Get('cards')
+  getCards(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query() dto: GetDiscoveryCardsDto,
+  ) {
+    return this.discoveryService.getCards(user.userId, dto.limit);
+  }
 
   @Get('swipe-limit')
   getSwipeLimitStatus(@CurrentUser() user: AuthenticatedUser) {

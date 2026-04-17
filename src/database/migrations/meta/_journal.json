@@ -57,6 +57,13 @@
       "when": 1776436552367,
       "tag": "0007_goofy_la_nuit",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1776437920348,
+      "tag": "0008_free_lifeguard",
+      "breakpoints": true
     }
   ]
 }
