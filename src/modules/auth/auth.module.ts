@@ -5,6 +5,7 @@ import { PassportModule } from '@nestjs/passport';
 import { type Env } from '../../config/env.schema';
 import { ReferralsModule } from '../referrals/referrals.module';
 import { SettingsModule } from '../settings/settings.module';
+import { SmsModule } from '../sms/sms.module';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { OauthIdentityService } from './oauth-identity.service';
@@ -15,6 +16,7 @@ import { JwtStrategy } from './strategies/jwt.strategy';
     PassportModule,
     SettingsModule,
     ReferralsModule,
+    SmsModule,
     JwtModule.registerAsync({
       inject: [ConfigService],
       useFactory: (configService: ConfigService<Env, true>) => ({

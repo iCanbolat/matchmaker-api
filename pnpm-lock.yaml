@@ -35,6 +35,9 @@ importers:
       '@nestjs/websockets':
         specifier: ^11.1.19
         version: 11.1.19(@nestjs/common@11.1.19(class-transformer@0.5.1)(class-validator@0.15.1)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.19)(@nestjs/platform-socket.io@11.1.19)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@netgsm/sms':
+        specifier: ^1.1.11
+        version: 1.1.11
       '@onesignal/node-onesignal':
         specifier: ^5.4.0
         version: 5.4.0
@@ -1293,6 +1296,10 @@ packages:
     peerDependenciesMeta:
       '@nestjs/platform-socket.io':
         optional: true
+
+  '@netgsm/sms@1.1.11':
+    resolution: {integrity: sha512-iaAJckmp+xBU+4/aFdXp0phOeygXm/8fS9sFa2uiz/vhhdAxGSlkwT6WaWOhYi74gryXUM4jKW9GjBj+nljekA==}
+    engines: {node: '>=14.0.0'}
 
   '@noble/hashes@1.8.0':
     resolution: {integrity: sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A==}
@@ -5049,6 +5056,8 @@ snapshots:
       tslib: 2.8.1
     optionalDependencies:
       '@nestjs/platform-socket.io': 11.1.19(@nestjs/common@11.1.19(class-transformer@0.5.1)(class-validator@0.15.1)(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/websockets@11.1.19)(rxjs@7.8.2)
+
+  '@netgsm/sms@1.1.11': {}
 
   '@noble/hashes@1.8.0': {}
 

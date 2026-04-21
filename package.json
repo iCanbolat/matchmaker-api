@@ -34,6 +34,7 @@
     "@nestjs/platform-socket.io": "^11.1.19",
     "@nestjs/throttler": "^6.5.0",
     "@nestjs/websockets": "^11.1.19",
+    "@netgsm/sms": "^1.1.11",
     "@onesignal/node-onesignal": "^5.4.0",
     "apple-signin-auth": "^2.0.0",
     "bcryptjs": "^3.0.3",

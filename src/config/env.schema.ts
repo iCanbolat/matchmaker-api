@@ -29,7 +29,7 @@ export const envSchema = z.object({
   DATABASE_URL: z
     .string()
     .min(1)
-    .default('postgresql://postgres:postgres@localhost:5432/matchmaker'),
+    .default('postgresql://postgres:postgres@localhost:5433/matchmaker'),
   DATABASE_POOL_MIN: z.coerce.number().int().positive().default(5),
   DATABASE_POOL_MAX: z.coerce.number().int().positive().default(20),
 
@@ -67,6 +67,21 @@ export const envSchema = z.object({
   JWT_REFRESH_EXPIRATION: z.string().default('7d'),
 
   PUBLIC_REGISTRATION_ENABLED: envBoolean.default(false),
+  SMS_ENABLED: envBoolean.default(false),
+  SMS_PROVIDER: z.enum(['netgsm']).default('netgsm'),
+  SMS_DEV_MOCK_BYPASS_VERIFICATION: envBoolean.default(true),
+  SMS_OTP_LENGTH: z.coerce.number().int().min(4).max(6).default(6),
+  SMS_OTP_TTL_SECONDS: z.coerce.number().int().positive().default(180),
+  SMS_OTP_COOLDOWN_SECONDS: z.coerce.number().int().positive().default(60),
+  SMS_PHONE_VERIFICATION_TOKEN_TTL_SECONDS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(600),
+  NETGSM_USERCODE: z.string().min(1).optional(),
+  NETGSM_PASSWORD: z.string().min(1).optional(),
+  NETGSM_MSGHEADER: z.string().min(1).optional(),
+  NETGSM_APPNAME: z.string().min(1).optional(),
   ADMIN_EMAILS: z.string().default(''),
   REFERRAL_BONUS_TYPE: z
     .enum(['none', 'plus_days', 'swipe_credit'])

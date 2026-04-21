@@ -12,6 +12,7 @@ import {
 export const users = pgTable('users', {
   id: uuid('id').defaultRandom().primaryKey(),
   email: varchar('email', { length: 255 }).notNull().unique(),
+  phoneNumber: varchar('phone_number', { length: 20 }).unique(),
   googleId: varchar('google_id', { length: 255 }).unique(),
   appleId: varchar('apple_id', { length: 255 }).unique(),
   passwordHash: varchar('password_hash', { length: 255 }).notNull(),
